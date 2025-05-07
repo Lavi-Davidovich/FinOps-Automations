@@ -1,0 +1,165 @@
+import base64
+import json
+import functions_framework
+from google.cloud import compute_v1,storage
+import re 
+
+def replace_at_symbol(email):
+    # Replace "@" with "at" using regex
+    email = re.sub(r'\.','_',email)
+    return re.sub(r'@', '_at_', email) 
+
+def read_labels_from_gcs(bucket_name, file_name):
+    """
+    Reads the label data from a JSON file stored in a GCS bucket.
+    """
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    content = blob.download_as_text()  # Reads the file content as text
+    print(f"Read from GCS: {content}")
+    return json.loads(content)  # Parse the JSON content 
+
+def compute_name(compute_engine):
+    pattern = r'instances/([a-zA-Z0-9_-]+)'
+    match = re.search(pattern, compute_engine)
+    # Extract the instance name if a match is found
+    if match:
+        instance_name = match.group(1)
+        return instance_name 
+
+# Triggered from a message on a Cloud Pub/Sub topic.
+@functions_framework.cloud_event
+def apply_labels(cloud_event): 
+    # Decode the base64-encoded message
+    pubsub_message = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    
+    # Parse the message as JSON
+    try:
+        message_json = json.loads(pubsub_message)
+        print(message_json) 
+        
+        # Extract required fields
+        instance_id = message_json.get("resource", {}).get("labels", {}).get("instance_id")
+        project_id = message_json.get("resource", {}).get("labels", {}).get("project_id")
+        zone = message_json.get("resource", {}).get("labels", {}).get("zone")
+        timestamp = message_json.get("timestamp")
+        creator_email = message_json.get("protoPayload",{}).get("authenticationInfo",{}).get("principalEmail")
+        compute_engine = message_json.get("protoPayload",{}).get("resourceName")
+        compute_engine = compute_name(compute_engine)
+        creator_at_email = replace_at_symbol(creator_email) 
+        
+        # Print the extracted values
+        print(f"Instance ID: {instance_id}")
+        print(f"Project ID: {project_id}")
+        print(f"Zone: {zone}")
+
+        bucket_name = "label-for-each-project"
+        file_name = "prod-sec-core-0-labels.json"
+        labels = read_labels_from_gcs(bucket_name, file_name) 
+
+        print(f"labels {labels}")
+
+        match = re.match(r"^\d{4}-\d{2}-\d{2}", timestamp)
+        labels["compute-engine"] = compute_engine
+        labels["created_by"] = creator_at_email
+        labels["created_date"] = match.group(0) 
+        print(f"New labels {labels}")
+        
+        if instance_id and project_id and zone:
+            # Call the function to add a label to the instance
+            print(labels)
+            add_label_to_instance(instance_id, project_id, zone,labels)
+        else:
+            print("One or more required fields are missing.") 
+    except json.JSONDecodeError as e:
+        print(f"Failed to decode JSON: {e}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+def label_disk(project_id, zone, disk_name, labels): 
+    """Adds labels to a specific disk."""
+    try:
+        disk_client = compute_v1.DisksClient()
+
+        # Get the disk to retrieve its label fingerprint
+        disk = disk_client.get(project=project_id, zone=zone, disk=disk_name)
+
+        # Merge existing and new labels. New labels overwrite existing ones on conflict.
+        updated_labels = {**disk.labels, **labels}
+
+        disk_set_labels_request = compute_v1.ZoneSetLabelsRequest(
+            label_fingerprint=disk.label_fingerprint,
+            labels=updated_labels,
+        )
+
+        request = compute_v1.SetLabelsDiskRequest(
+            project=project_id,
+            zone=zone,
+            resource=disk_name,
+            zone_set_labels_request_resource=disk_set_labels_request,
+        )
+
+        operation = disk_client.set_labels(request=request)
+
+        # (Optional) Wait for the operation to complete
+        operation.result()  # You might want to add timeout handling here
+
+        print(f"Updated labels for disk {disk_name} in zone {zone}")
+
+    except Exception as e:
+        print(f"Error updating disk {disk_name} in zone {zone}: {e}")
+
+def add_label_to_instance(instance_id, project_id, zone, all_labels):
+    """
+    Add a label to a specified GCE instance.
+    """
+    try:
+        # Initialize the Compute Engine client
+        instances_client = compute_v1.InstancesClient()
+        
+        # Get the current labels and fingerprint of the instance
+        instance = instances_client.get(project=project_id, zone=zone, instance=instance_id)
+
+        disks = instance.disks  # This should be a 'RepeatedComposite' field
+
+        # Iterate over each disk object and extract the 'source' URL
+        disk_names = [disk.source.split('/')[-1] for disk in disks] 
+
+        # Print the extracted source URLs
+       
+        labels = instance.labels or {}
+
+        fingerprint = instance.label_fingerprint
+
+        final_labels = {**labels, **all_labels}
+        print(final_labels)
+
+        for disk_name in disk_names:
+            label_disk(project_id,zone,disk_name,final_labels) 
+        
+        # Prepare the label update request
+        instances_set_labels_request = compute_v1.InstancesSetLabelsRequest(
+            label_fingerprint=fingerprint,
+            labels=final_labels
+        )
+        
+        # Execute the label update request
+        operation = instances_client.set_labels(
+            project=project_id,
+            zone=zone,
+            instance=instance_id,
+            instances_set_labels_request_resource=instances_set_labels_request
+        )
+        
+        # Wait for the operation to complete
+        operation_client = compute_v1.ZoneOperationsClient()
+        operation_client.wait(
+            project=project_id,
+            zone=zone,
+            operation=operation.name
+        ) 
+        print(f"Label added successfully to instance {instance_id}.")
+    except Exception as e:
+        print(f"An error occurred while adding a label: {e}")
